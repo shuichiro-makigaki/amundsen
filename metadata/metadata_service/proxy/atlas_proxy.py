@@ -1,15 +1,16 @@
 # Copyright Contributors to the Amundsen project.
 # SPDX-License-Identifier: Apache-2.0
 
+import abc
 import datetime
 import logging
 import re
+from collections import defaultdict
 from operator import attrgetter
 from random import randint
-from typing import Any, Dict, Generator, List, Optional, Pattern, Tuple, Union
 
 from amundsen_common.models.dashboard import DashboardSummary
-from amundsen_common.models.lineage import Lineage
+from amundsen_common.models.lineage import Lineage, LineageItem
 from amundsen_common.models.popular_table import PopularTable
 from amundsen_common.models.table import (Badge, Column,
                                           ProgrammaticDescription, Reader,
@@ -27,6 +28,7 @@ from apache_atlas.utils import type_coerce
 from beaker.cache import CacheManager
 from beaker.util import parse_cache_config_options
 from flask import current_app as app
+from typing import Any, Dict, Generator, List, Optional, Tuple, Union, Type
 from werkzeug.exceptions import BadRequest
 
 from metadata_service.entity.dashboard_detail import \
@@ -49,79 +51,209 @@ class Status:
     DELETED = "DELETED"
 
 
-# TODO: Move this to amundsencommon
-DEFAULT_TABLE_QN_REGEX = re.compile(r"""
-    ^(?P<db_name>.*?)\.(?P<table_name>.*)@(?P<cluster_name>.*?)$
-    """, re.X)
-
-# TODO: Move this to amundsencommon
-DEFAULT_DB_CLUSTER = 'default'
-
-
-# TODO: Move this to amundsencommon
-def parse_table_qualified_name(qualified_name: str, qn_regex: Pattern = DEFAULT_TABLE_QN_REGEX) -> Dict:
+class Key(abc.ABC):
     """
-    Parses the Atlas' table qualified name
-    :param qualified_name: Qualified Name of the table
-    :param qn_regex: Default Qualified Name regex.
-    :return: A dictionary consisting of database name,
-    table name and cluster name of the table.
-    If database or cluster name not found,
-    then uses the 'atlas_default' as both of them.
+    Class for unification of entity keys between Atlas and Amundsen ecosystems.
+
+    Since Atlas can be populated both by tools from 'Atlas world' (like Apache Atlas Hive hook/bridge) and Amundsen
+    Databuilder (and each of the approach has a different way to render unique identifiers) we need such class
+    to serve as unification layer.
     """
 
-    def apply_qn_regex(name: str, table_qn_regex: Pattern) -> Any:
-        return table_qn_regex.match(name)
+    def __init__(self, raw_id: str, source: Optional[str] = None):
+        self._raw_identifier = raw_id
+        self._source = source
 
-    _regex_result = apply_qn_regex(qualified_name, qn_regex)
+    @property
+    def is_qualified_name(self):
+        """
+        Property assessing whether raw_id is qualified name.
 
-    if not _regex_result:
-        qn_regex = re.compile(r"""
-        ^(?P<table_name>.*)@(?P<cluster_name>.*?)$
-        """, re.X)
-        _regex_result = apply_qn_regex(qualified_name, qn_regex)
+        :returns: -
+        """
+        if self.atlas_qualified_name_regex.match(self._raw_identifier):
+            return True
+        else:
+            return False
 
-    if not _regex_result:
-        qn_regex = re.compile(r"""
-        ^(?P<db_name>.*?)\.(?P<table_name>.*)$
-        """, re.X)
-        _regex_result = apply_qn_regex(qualified_name, qn_regex)
+    @property
+    def is_amundsen_key(self):
+        """
+        Property assessing whether raw_id is amundsen key.
 
-    if not _regex_result:
-        qn_regex = re.compile(r"""
-        ^(?P<table_name>.*)$
-        """, re.X)
-        _regex_result = apply_qn_regex(qualified_name, qn_regex)
+        :returns: -
+        """
+        if self.amundsen_key_regex.match(self._raw_identifier):
+            return True
+        else:
+            return False
 
-    _regex_result = _regex_result.groupdict()
+    def get_details(self) -> Dict[str, str]:
+        """
+        Collect as many details from key (either qn or amundsen key)
 
-    qn_dict = {
-        'table_name': _regex_result.get('table_name', qualified_name),
-        'db_name': _regex_result.get('db_name', DEFAULT_DB_CLUSTER),
-        'cluster_name': _regex_result.get('cluster_name', DEFAULT_DB_CLUSTER),
-    }
+        :returns: dictionary of entity properties derived from key
+        """
+        if self.is_qualified_name:
+            return self.get_details_from_qualified_name()
+        elif self.is_amundsen_key:
+            return self.get_details_from_key()
+        else:
+            raise ValueError(f'Value is neither valid qualified name nor amundsen key: {self._raw_identifier}')
 
-    return qn_dict
+    def _get_details(self, pattern):
+        """
+        Helper function collecting data from regex match
+
+        :returns: dictionary of matched regex groups with their values
+        """
+        try:
+            result = pattern.match(self._raw_identifier).groupdict()
+
+            return result
+        except KeyError:
+            raise KeyError
+
+    def get_details_from_qualified_name(self):
+        """
+        Collect as many details from qualified name
+
+        :returns: dictionary of entity properties derived from qualified name
+        """
+        try:
+            return self._get_details(self.atlas_qualified_name_regex)
+        except KeyError:
+            raise ValueError(f'This is not valid qualified name: {self._raw_identifier}')
+
+    def get_details_from_key(self):
+        """
+        Collect as many details from amundsen key
+
+        :returns: dictionary of entity properties derived from amundsen key
+        """
+        try:
+            return self._get_details(self.amundsen_key_regex)
+        except KeyError:
+            raise ValueError(f'This is not valid qualified name: {self._raw_identifier}')
+
+    @property
+    @abc.abstractmethod
+    def atlas_qualified_name_regex(self):
+        """
+        Regex for validating qualified name (and collecting details from qn parts)
+
+        :returns: -
+        """
+        pass
+
+    @property
+    @abc.abstractmethod
+    def amundsen_key_regex(self):
+        """
+        Regex for validating amundsen key (and collecting details from key parts)
+
+        :returns: -
+        """
+        pass
+
+    @property
+    @abc.abstractmethod
+    def qualified_name(self):
+        """
+        Properly formatted qualified name
+
+        :returns: -
+        """
+        pass
+
+    @property
+    @abc.abstractmethod
+    def amundsen_key(self):
+        """
+        Properly formetted amundsen key
+
+        :returns: -
+        """
+        pass
 
 
-# TODO: Move this to amundsencommon
-def make_table_qualified_name(table_name: str, cluster: Optional[Any] = None, db: Optional[Any] = None) -> str:
-    """
-    Based on the given parameters, generate the Atlas' table qualified Name
-    :param db: Database Name of the table
-    :param table_name: Table Name
-    :param cluster: Cluster Name of the table
-    :return: A string i.e., Qualified Name of the table
-    If database or cluster name are 'atlas_default', then simply strips that part.
-    """
-    qualified_name = table_name
-    if db and db != DEFAULT_DB_CLUSTER:
-        qualified_name = '{}.{}'.format(db, qualified_name)
+class TableKey(Key):
+    @property
+    def atlas_qualified_name_regex(self):
+        return re.compile(r'^(?P<db>.*?)\.(?P<table>.*)@(?P<cluster>.*?)$', re.X)
 
-    if cluster and cluster != DEFAULT_DB_CLUSTER:
-        qualified_name = '{}@{}'.format(qualified_name, cluster)
+    @property
+    def amundsen_key_regex(self):
+        return re.compile(r'^(?P<source>.*?)://(?P<cluster>.*?)\.(?P<db>.*?)\/(?P<table>.*?)$', re.X)
 
-    return qualified_name
+    @property
+    def qualified_name(self) -> str:
+        spec = self.get_details_from_key()
+
+        db = spec['db']
+        table = spec['table']
+        cluster = spec['cluster']
+
+        return f'{db}.{table}@{cluster}'
+
+    @property
+    def amundsen_key(self):
+        if self.is_qualified_name:
+            spec = self.get_details_from_qualified_name()
+
+            db = spec['db']
+            table = spec['table']
+            cluster = spec['cluster']
+
+            return f'{self._source}://{cluster}.{db}/{table}'
+        elif self.is_amundsen_key:
+            return self._raw_identifier
+        else:
+            raise ValueError(f'Value is neither qualified name nor amundsen key: {self._raw_identifier}')
+
+
+class ColumnKey(Key):
+    @property
+    def atlas_qualified_name_regex(self):
+        return re.compile(r'^(?P<db>.*?)\.(?P<table>.*)\.(?P<column>.*?)@(?P<cluster>.*?)$', re.X)
+
+    @property
+    def amundsen_key_regex(self):
+        return re.compile(r'^(?P<source>.*?)://(?P<cluster>.*?)\.(?P<db>.*?)\/(?P<table>.*?)\/(?P<column>.*)$', re.X)
+
+    @property
+    def qualified_name(self) -> str:
+        if self.is_amundsen_key:
+            spec = self.get_details_from_key()
+
+            db = spec['db']
+            table = spec['table']
+            cluster = spec['cluster']
+            column = spec['column']
+
+            return f'{db}.{table}.{column}@{cluster}'
+        elif self.is_qualified_name:
+            return self._raw_identifier
+        else:
+            raise ValueError(f'Value is neither qualified name nor amundsen key: {self._raw_identifier}')
+
+    @property
+    def amundsen_key(self):
+        if self.is_qualified_name:
+            spec = self.get_details_from_qualified_name()
+
+            db = spec['db']
+            table = spec['table']
+            cluster = spec['cluster']
+            column = spec['column']
+
+            source = self._source.replace('column', 'table')
+
+            return f'{source}://{cluster}.{db}/{table}/{column}'
+        elif self.is_amundsen_key:
+            return self._raw_identifier
+        else:
+            raise ValueError(f'Value is neither qualified name nor amundsen key: {self._raw_identifier}')
 
 
 # noinspection PyMethodMayBeStatic
@@ -164,29 +296,6 @@ class AtlasProxy(BaseProxy):
         protocol = 'https' if encrypted else 'http'
         self.client = AtlasClient(f'{protocol}://{host}:{port}', (user, password))
         self.client.session.verify = validate_ssl
-
-    def _extract_info_from_uri(self, *, table_uri: str) -> Dict:
-        """
-        Extracts the table information from table_uri coming from frontend.
-        :param table_uri:
-        :return: Dictionary object, containing following information:
-        entity: Type of entity example: rdbms_table, hive_table etc.
-        cluster: Cluster information
-        db: Database Name
-        name: Table Name
-        """
-        pattern = re.compile(r"""
-            ^   (?P<entity>.*?)
-            :\/\/
-                (?P<cluster>.*)
-            \.
-                (?P<db>.*?)
-            \/
-                (?P<name>.*?)
-            $
-        """, re.X)
-        result = pattern.match(table_uri)
-        return result.groupdict() if result else dict()
 
     def _parse_bookmark_qn(self, bookmark_qn: str) -> Dict:
         """
@@ -232,15 +341,11 @@ class AtlasProxy(BaseProxy):
         :param table_uri: The table URI coming from Amundsen Frontend
         :return: A table entity matching the Qualified Name derived from table_uri
         """
-        table_info = self._extract_info_from_uri(table_uri=table_uri)
-        table_qn = make_table_qualified_name(table_info.get('name', ''),
-                                             table_info.get('cluster'),
-                                             table_info.get('db')
-                                             )
+        key = TableKey(table_uri)
 
         try:
-            return self.client.entity.get_entity_by_attribute(type_name=table_info['entity'],
-                                                              uniq_attributes=[(self.QN_KEY, table_qn)])
+            return self.client.entity.get_entity_by_attribute(type_name=key.get_details()['source'],
+                                                              uniq_attributes=[(self.QN_KEY, key.qualified_name)])
         except Exception as ex:
             LOGGER.exception(f'Table not found. {str(ex)}')
             raise NotFoundException('Table URI( {table_uri} ) does not exist'
@@ -290,7 +395,8 @@ class AtlasProxy(BaseProxy):
         :param user_id: Qualified Name of a user
         :return:
         """
-        table_info = self._extract_info_from_uri(table_uri=entity_uri)
+        table_info = TableKey(entity_uri).get_details()
+
         bookmark_qn = '{}.{}.{}.{}.bookmark@{}'.format(table_info.get('db'),
                                                        table_info.get('name'),
                                                        table_info.get('entity'),
@@ -475,9 +581,7 @@ class AtlasProxy(BaseProxy):
 
             programmatic_descriptions = self._get_programmatic_descriptions(attrs.get('parameters', dict()))
 
-            table_qn = parse_table_qualified_name(
-                qualified_name=attrs.get(self.QN_KEY)
-            )
+            table_info = TableKey(attrs.get(self.QN_KEY)).get_details()
 
             badges = []
             # Using or in case, if the key 'classifications' is there with a None
@@ -511,9 +615,9 @@ class AtlasProxy(BaseProxy):
 
             table = Table(
                 database=table_details.get('typeName'),
-                cluster=table_qn.get('cluster_name', ''),
-                schema=table_qn.get('db_name', ''),
-                name=attrs.get('name') or table_qn.get("table_name", ''),
+                cluster=table_info.get('cluster', ''),
+                schema=table_info.get('db', ''),
+                name=attrs.get('name') or table_info.get("table_name", ''),
                 badges=badges,
                 tags=tags,
                 description=attrs.get('description') or attrs.get('comment'),
@@ -850,13 +954,11 @@ class AtlasProxy(BaseProxy):
         for table in entities:
             table_attrs = table.attributes
 
-            table_qn = parse_table_qualified_name(
-                qualified_name=table_attrs.get(self.QN_KEY)
-            )
+            table_info = TableKey(table_attrs.get(self.QN_KEY)).get_details()
 
-            table_name = table_qn.get("table_name") or table_attrs.get('name')
-            db_name = table_qn.get("db_name", '')
-            db_cluster = table_qn.get("cluster_name", '')
+            table_name = table_info.get('table') or table_attrs.get('name')
+            db_name = table_info.get('db', '')
+            db_cluster = table_info.get('cluster', '')
 
             popular_table = PopularTable(
                 database=table.typeName,
@@ -976,7 +1078,8 @@ class AtlasProxy(BaseProxy):
 
         resources = []
         for record in search_results.entities:
-            table_info = self._extract_info_from_uri(table_uri=record.attributes[self.ENTITY_URI_KEY])
+            table_info = TableKey(record.attributes[self.ENTITY_URI_KEY]).get_details()
+
             res = self._parse_bookmark_qn(record.attributes[self.QN_KEY])
             resources.append(PopularTable(
                 database=table_info['entity'],
@@ -1004,7 +1107,6 @@ class AtlasProxy(BaseProxy):
         #     entity_type = 'Dashboard'
         else:
             LOGGER.exception(f'Resource Type ({resource_type}) is not yet implemented')
-            raise NotImplemented
 
         user_entity = self.client.entity.get_entity_by_attribute(type_name=self.USER_TYPE,
                                                                  uniq_attributes=[(self.QN_KEY, user_id)]).entity
@@ -1079,12 +1181,12 @@ class AtlasProxy(BaseProxy):
             count = reader.attributes.get('count')
 
             if count:
-                details = self._extract_info_from_uri(table_uri=entity_uri)
+                table_info = TableKey(entity_uri).get_details()
 
-                _results[count] = dict(cluster=details.get('cluster'),
-                                       name=details.get('name'),
-                                       schema=details.get('db'),
-                                       database=details.get('entity'))
+                _results[count] = dict(cluster=table_info.get('cluster'),
+                                       name=table_info.get('name'),
+                                       schema=table_info.get('db'),
+                                       database=table_info.get('entity'))
 
         sorted_counts = sorted(_results.keys())
 
@@ -1104,7 +1206,7 @@ class AtlasProxy(BaseProxy):
                                       resource_type: ResourceType) -> None:
 
         if resource_type is not ResourceType.Table:
-            raise NotImplemented('resource type {} is not supported'.format(resource_type))
+            raise NotImplementedError('resource type {} is not supported'.format(resource_type))
 
         entity = self._get_bookmark_entity(entity_uri=id, user_id=user_id)
         entity.entity[self.ATTRS_KEY][self.BOOKMARK_ACTIVE_KEY] = True
@@ -1116,7 +1218,7 @@ class AtlasProxy(BaseProxy):
                                          relation_type: UserResourceRel,
                                          resource_type: ResourceType) -> None:
         if resource_type is not ResourceType.Table:
-            raise NotImplemented('resource type {} is not supported'.format(resource_type))
+            raise NotImplementedError('resource type {} is not supported'.format(resource_type))
 
         entity = self._get_bookmark_entity(entity_uri=id, user_id=user_id)
         entity.entity[self.ATTRS_KEY][self.BOOKMARK_ACTIVE_KEY] = False
@@ -1201,6 +1303,199 @@ class AtlasProxy(BaseProxy):
                                   resource_type: ResourceType) -> Dict[str, List[DashboardSummary]]:
         return {}
 
-    def get_lineage(self, *,
-                    id: str, resource_type: ResourceType, direction: str, depth: int) -> Lineage:
-        pass
+    @classmethod
+    def _generate_edges(cls, graph: Dict[str, List[str]]) -> List[Tuple[str, str]]:
+        """
+        Generates pairs of edges in the graph
+
+        :param graph: Graph of nodes
+        :return edges: List of tuples with graph edges
+        """
+        edges = []
+
+        # for each node in graph
+        for node in graph:
+            # for each neighbour node of a single node
+            for neighbour in graph[node]:
+                # if edge exists then append
+                edges.append((node, neighbour))
+        return edges
+
+    @classmethod
+    def _find_shortest_path(cls, graph: Dict[str, List[str]], start: str, end: str, path: List[Any] = []):
+        """
+        Find shortest path between graph nodes. Used to calculate 'level' parameter
+
+        __source__='https://www.python.org/doc/essays/graphs/'
+        __author__='Guido van Rossum'
+
+        :param graph: Dictionary of str (node key) and List[str] (connected nodes)
+        :param start: Starting node for finding the path
+        :param end: Ending node for finding the path
+        :param path: Accumulator for recursive calls
+        :return path: Shortest path between start and end nodes
+        """
+        path = path + [start]
+
+        if start == end:
+            return path
+        if not graph.get(start):
+            return None
+        shortest = None
+        for node in graph[start]:
+            if node not in path:
+                newpath = AtlasProxy._find_shortest_path(graph, node, end, path)
+                if newpath:
+                    if not shortest or len(newpath) < len(shortest):
+                        shortest = newpath
+
+        return shortest
+
+    def _serialize_lineage(self, lineage: dict, entity_type: str, root_node: str, direction: str,
+                           key_class: Union[Type[TableKey], Type[ColumnKey]]) -> List[LineageItem]:
+        """
+        Serializes lineage to Amundsen format based on Atlas lineage output.
+
+        The assumption for Atlas <> Amundsen lineage is that every PROCESS entity in Atlas lineage contains at least
+        one entity of entity_type both in inputs and outpus.
+
+        If your lineage is A > B > C where:
+            A - is table
+            B - is file
+            C - is table
+        It won't render A > C table lineage in Amundsen.
+
+        The implementation follows simplified set of expectations and might be subject of change if such requirement
+        arises.
+
+        :param lineage: Raw lineage from Atlas
+        :param entity_type: Type of the entity for which lineage is being retrieved
+        :param root_node: key of entity for which lineage will be rendered. Required to calculate 'level' dynamically
+        based on nodes distance.
+        :param direction: upstream/downstream
+        :param key_class: Class for serializing entities keys
+        :return: The Lineage object with upstream & downstream lineage items
+        """
+        entity_type = entity_type.lower()
+
+        result: List[LineageItem] = []
+
+        entities = lineage.get('guidEntityMap', dict())
+        relations = lineage.get('relations', [])
+
+        _graph: Dict[str, List[str]] = defaultdict(list)
+
+        processes: Dict[str, Dict[str, Any]] = dict()
+
+        # Since Atlas bases lineage on additional entity (Process(input=A, output=B)) for capturing lineage
+        # we need to create graph that has direct A > B relationships and removes Process entities
+        for relation in relations:
+            input_guid = relation['fromEntityId']
+            input_type = entities.get(input_guid)['typeName'].lower()
+
+            output_guid = relation['toEntityId']
+            output_type = entities.get(output_guid)['typeName'].lower()
+
+            if input_type.endswith('process') and output_type.endswith(entity_type):
+                output_qn = entities.get(output_guid)[self.ATTRS_KEY][self.QN_KEY]
+                output_key = key_class(output_qn, output_type).amundsen_key  # type: ignore
+
+                if not processes.get(input_guid):
+                    processes[input_guid] = dict(inputs=set(), outputs=set())
+
+                processes[input_guid]['outputs'].add(output_key)
+
+            elif output_type.endswith('process') and input_type.endswith(entity_type):
+                input_qn = entities.get(input_guid)[self.ATTRS_KEY][self.QN_KEY]
+                input_key = key_class(input_qn, input_type).amundsen_key  # type: ignore
+
+                if not processes.get(output_guid):
+                    processes[output_guid] = dict(inputs=set(), outputs=set())
+
+                processes[output_guid]['inputs'].add(input_key)
+
+        for _, spec in processes.items():
+            for input_key in spec['inputs']:
+                for output_key in spec['outputs']:
+                    _graph[input_key].append(output_key)
+
+        edges = AtlasProxy._generate_edges(_graph)
+        graph = dict(_graph)
+
+        for edge in edges:
+            if direction == 'upstream':
+                key, parent = edge
+                level = len(AtlasProxy._find_shortest_path(graph, key, root_node)) - 1
+            elif direction == 'downstream':
+                parent, key = edge
+                level = len(AtlasProxy._find_shortest_path(graph, root_node, key)) - 1
+            else:
+                raise ValueError(f'Direction {direction} not supported!')
+
+            badges: List[str] = []
+            usage = 0
+            source = key_class(key).get_details()['source']
+
+            lineage_item_spec = dict(key=key,
+                                     # parent=parent # @todo uncomment when graph vis is available
+                                     source=source,
+                                     badges=badges,
+                                     usage=usage,
+                                     level=level)
+
+            result.append(LineageItem(**lineage_item_spec))
+
+        return result
+
+    def get_lineage(self, *, id: str, resource_type: ResourceType, direction: str, depth: int) -> Lineage:
+        """
+        Retrieves the lineage information for the specified resource type.
+
+        :param id: Key of entity for which lineage will be collected
+        :param resource_type: Type of the entity for which lineage is being retrieved
+        :param direction: Whether to get the upstream/downstream or both directions
+        :param depth: Depth or level of lineage information. 0=only parent, 1=immediate nodes, 2=...
+        :return: The Lineage object with upstream & downstream lineage items
+        """
+        lineage_spec: Dict[str, Any] = dict(key=id,
+                                            direction=direction,
+                                            depth=depth,
+                                            upstream_entities=[],
+                                            downstream_entities=[])
+
+        # Atlas returns complete lineage when depth=0. In Amundsen depth=0 means only parent.
+        if depth > 0:
+            key_class: Union[Type[TableKey], Type[ColumnKey]]
+
+            if resource_type == ResourceType.Column:
+                key_class = ColumnKey
+            elif resource_type == ResourceType.Table:
+                key_class = TableKey
+            else:
+                raise NotImplementedError(f'Resource {resource_type.name} not supported!')
+
+            key = key_class(id)  # type: ignore
+
+            entity = self.client.entity.get_entity_by_attribute(type_name=resource_type.name,
+                                                                uniq_attributes=[('qualifiedName', key.qualified_name)])
+
+            entity_guid = entity.entity.guid
+
+            _upstream: Dict[str, Any] = {}
+            _downstream: Dict[str, Any] = {}
+
+            if not direction == 'downstream':
+                _upstream = self.client.lineage.get_lineage_info(entity_guid, 'INPUT', depth)
+
+            if not direction == 'upstream':
+                _downstream = self.client.lineage.get_lineage_info(entity_guid, 'OUTPUT', depth)
+
+            upstream = self._serialize_lineage(_upstream, resource_type.name, id, 'upstream', key_class)
+            downstream = self._serialize_lineage(_downstream, resource_type.name, id, 'downstream', key_class)
+
+            lineage_spec['upstream_entities'] = upstream
+            lineage_spec['downstream_entities'] = downstream
+
+        lineage = Lineage(**lineage_spec)
+
+        return lineage
