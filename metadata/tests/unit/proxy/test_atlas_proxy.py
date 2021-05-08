@@ -3,18 +3,19 @@
 
 import copy
 import unittest
-from typing import Any, Dict, Optional, cast
 from unittest.mock import MagicMock, patch
 
+from apache_atlas.model.instance import AtlasRelatedObjectId
+from apache_atlas.model.relationship import AtlasRelationship
+from apache_atlas.utils import type_coerce
+from typing import Any, Dict, Optional, cast
+from werkzeug.exceptions import BadRequest
+
+from amundsen_common.models.lineage import Lineage, LineageItem
 from amundsen_common.models.popular_table import PopularTable
 from amundsen_common.models.table import (Badge, Column,
                                           ProgrammaticDescription, Reader,
                                           ResourceReport, Stat, Table, User)
-from apache_atlas.model.instance import AtlasRelatedObjectId
-from apache_atlas.model.relationship import AtlasRelationship
-from apache_atlas.utils import type_coerce
-from werkzeug.exceptions import BadRequest
-
 from metadata_service import create_app
 from metadata_service.entity.resource_type import ResourceType
 from metadata_service.entity.tag_detail import TagDetail
@@ -550,6 +551,36 @@ class TestAtlasProxy(unittest.TestCase, Data):
                     low, _ = result
 
                     assert low.partition_value.startswith(low_date_prefix)
+
+    def test_get_lineage_table(self) -> None:
+        key = 'hive_table://demo.sample/table_2'
+        resource_type = ResourceType.Table
+        direction = 'both'
+        depth = 3
+        source = 'hive_table'
+
+        expected_upstream = [LineageItem(key='hive_table://demo.sample/table_0',
+                                         level=2, source=source, badges=[], usage=0),
+                             LineageItem(key='hive_table://demo.sample/table_1',
+                                         level=1, source=source, badges=[], usage=0),
+                             LineageItem(key='hive_table://demo.sample/table_4',
+                                         level=1, source=source, badges=[], usage=0)]
+
+        expected_downstream = [LineageItem(key='hive_table://demo.sample/table_3',
+                                           level=1, source=source, badges=[], usage=0)]
+
+        expected = Lineage(key=key, direction=direction, depth=depth,
+                           upstream_entities=expected_upstream, downstream_entities=expected_downstream)
+
+        self.proxy.client.lineage.get_lineage_info = MagicMock(side_effect=[self.lineage_upstream_table_2,
+                                                                            self.lineage_downstream_table_2])
+
+        result = self.proxy.get_lineage(id=key,
+                                        resource_type=resource_type,
+                                        direction='both',
+                                        depth=3)
+
+        self.assertEqual(expected, result)
 
 
 if __name__ == '__main__':

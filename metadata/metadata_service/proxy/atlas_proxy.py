@@ -1424,10 +1424,10 @@ class AtlasProxy(BaseProxy):
 
         for edge in edges:
             if direction == 'upstream':
-                key, parent = edge
+                key, _ = edge
                 level = len(AtlasProxy._find_shortest_path(graph, key, root_node)) - 1
             elif direction == 'downstream':
-                parent, key = edge
+                _, key = edge
                 level = len(AtlasProxy._find_shortest_path(graph, root_node, key)) - 1
             else:
                 raise ValueError(f'Direction {direction} not supported!')
@@ -1437,7 +1437,6 @@ class AtlasProxy(BaseProxy):
             source = key_class(key).get_details()['source']
 
             lineage_item_spec = dict(key=key,
-                                     # parent=parent # @todo uncomment when graph vis is available
                                      source=source,
                                      badges=badges,
                                      usage=usage,
